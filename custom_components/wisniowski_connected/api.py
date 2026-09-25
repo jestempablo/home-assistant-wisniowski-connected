@@ -330,31 +330,46 @@ class WisniowskiClient:
 
         base_url = (broker_url or self.broker_url).rstrip("/")
         url = f"{base_url}/graphql/?opname={operation_name}"
-        headers = {
-            "Authorization": f"Bearer {await self.async_access_token()}",
-            "APOLLO-QUERY-NAME": operation_name,
-            "Content-Type": "application/json",
-            "X-Installation-Subtype": INSTALLATION_SUBTYPE,
-        }
         body = {
             "operationName": operation_name,
             "query": query,
             "variables": variables,
         }
 
-        try:
-            async with self._session.post(url, headers=headers, json=body, timeout=REQUEST_TIMEOUT) as response:
-                payload = await response.json(content_type=None)
-                if response.status == 401:
-                    await self._force_refresh()
-                    return await self.async_graphql(operation_name, query, variables, broker_url)
-                if response.status >= 400:
-                    raise WisniowskiApiError(str(payload))
-                if errors := payload.get("errors"):
-                    raise WisniowskiApiError(str(errors))
-                return payload.get("data") or {}
-        except (ClientError, asyncio.TimeoutError) as exc:
-            raise WisniowskiApiError(str(exc)) from exc
+        # Retry authentication once, after releasing the previous response.
+        for attempt in range(2):
+            if attempt:
+                await self._force_refresh()
+            headers = {
+                "Authorization": f"Bearer {await self.async_access_token()}",
+                "APOLLO-QUERY-NAME": operation_name,
+                "Content-Type": "application/json",
+                "X-Installation-Subtype": INSTALLATION_SUBTYPE,
+            }
+            try:
+                async with self._session.post(url, headers=headers, json=body, timeout=REQUEST_TIMEOUT) as response:
+                    if response.status == 401:
+                        continue
+                    raw = await response.text()
+                    try:
+                        payload = json.loads(raw)
+                    except ValueError:
+                        # Proxies may return HTML during outages. Report an API
+                        # error without refreshing a potentially valid token.
+                        raise WisniowskiApiError(
+                            f"non-JSON response HTTP {response.status}: {raw[:200]!r}"
+                        ) from None
+                    if response.status >= 400:
+                        raise WisniowskiApiError(str(payload))
+                    if not isinstance(payload, dict):
+                        raise WisniowskiApiError(f"Invalid GraphQL response HTTP {response.status}: expected an object")
+                    if errors := payload.get("errors"):
+                        raise WisniowskiApiError(str(errors))
+                    return payload.get("data") or {}
+            except (ClientError, asyncio.TimeoutError) as exc:
+                raise WisniowskiApiError(str(exc)) from exc
+
+        raise WisniowskiAuthError("GraphQL request returned HTTP 401 after token refresh")
 
     async def _force_refresh(self) -> None:
         self._data[CONF_EXPIRES_AT] = 0

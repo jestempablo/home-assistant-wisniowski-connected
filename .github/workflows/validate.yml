@@ -11,6 +11,24 @@ permissions:
   contents: read
 
 jobs:
+  test-api:
+    name: API tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install test dependencies
+        run: python -m pip install -r requirements-test.txt
+
+      - name: Test cloud client
+        run: python -m unittest discover -s tests -v
+
   validate-hacs:
     name: HACS
     runs-on: ubuntu-latest

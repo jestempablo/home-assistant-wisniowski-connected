@@ -150,3 +150,12 @@ For inclusion as a default HACS repository, the project also needs a public GitH
 ## Maintenance
 
 This project is maintained in spare time. Pull requests and clear test reports are welcome, but support for untested hardware and account setups cannot be promised.
+
+To run the cloud client regression tests with Python 3.13:
+
+```sh
+python -m pip install -r requirements-test.txt
+python -m unittest discover -s tests -v
+```
+
+The tests use a local HTTP server and synthetic tokens; no Home Assistant installation, cloud account, or gate is required.
