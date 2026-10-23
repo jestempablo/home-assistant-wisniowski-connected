@@ -52,7 +52,10 @@ class WisniowskiCoordinator(DataUpdateCoordinator[dict[str, WisniowskiGate]]):
         """Start first refresh and websocket listener."""
 
         await self.async_config_entry_first_refresh()
-        self._subscription_task = self.hass.async_create_task(self._subscription_loop())
+        # The listener never finishes, so startup must not wait for it as a tracked task.
+        self._subscription_task = self.hass.async_create_background_task(
+            self._subscription_loop(), f"{DOMAIN} subscription"
+        )
 
     async def async_stop(self) -> None:
         """Stop websocket listener."""
