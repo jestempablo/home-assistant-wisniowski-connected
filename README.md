@@ -130,6 +130,8 @@ Cloud API authenticated is off: check Home Assistant logs for `wisniowski_connec
 
 ## Privacy And Logs
 
+To download diagnostics, open the integration's configuration entry in **Settings → Devices & services** and choose **Download diagnostics** from its menu. The report lists cached gate connectivity and supported controls. It also works when the entry is unloaded.
+
 Do not share account passwords, authorization URLs containing `code=...`, access tokens, refresh tokens, or full unredacted Home Assistant logs.
 
 Useful issue reports include:
@@ -141,21 +143,30 @@ Useful issue reports include:
 - redacted Home Assistant logs
 - screenshots of entity states with sensitive identifiers hidden
 
-## HACS Default Repository Notes
+## HACS and Marketplace
 
-This repository is structured for HACS as a custom integration: one integration under `custom_components/wisniowski_connected`, `hacs.json` in the repository root, and GitHub Actions for HACS and hassfest validation.
+Home Assistant 2026.11 includes the Marketplace under **Settings → Marketplace**. You can install this public repository using **Add from link**. Earlier Home Assistant releases use HACS.
 
-For inclusion as a default HACS repository, the project also needs a public GitHub repository with a description, topics, issues enabled, passing HACS/hassfest checks, a GitHub release, and a separate Home Assistant Brands submission for the domain icon/logo.
+Marketplace and HACS share the `hacs/default` catalog. Inclusion requires passing HACS and hassfest checks and a full GitHub release. The integration already ships its icon under `custom_components/wisniowski_connected/brand/`. See the [catalog submission guide](https://contributors.home-assistant.io/marketplace/guides/catalog/).
 
 ## Maintenance
 
 This project is maintained in spare time. Pull requests and clear test reports are welcome, but support for untested hardware and account setups cannot be promised.
 
-To run the cloud client regression tests with Python 3.13:
+Run the cloud client regression tests in a Python 3.13 virtual environment.
 
 ```sh
 python -m pip install -r requirements-test.txt
 python -m unittest discover -s tests -v
 ```
 
-The tests use a local HTTP server and synthetic tokens; no Home Assistant installation, cloud account, or gate is required.
+These tests use a local HTTP server and synthetic tokens.
+
+Run the integration tests in a separate Python 3.14 virtual environment (3.14.2 or newer).
+
+```sh
+python -m pip install -r requirements-test-ha.txt
+python -m pytest -q tests/ha
+```
+
+The integration tests use the official `pytest-homeassistant` fixtures, a temporary Home Assistant instance, and simulated Lavva responses and push events.

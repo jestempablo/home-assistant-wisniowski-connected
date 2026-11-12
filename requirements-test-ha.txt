@@ -1,0 +1,2 @@
+# The official fixtures pin the matching Home Assistant Core release.
+pytest-homeassistant==2026.11.1
