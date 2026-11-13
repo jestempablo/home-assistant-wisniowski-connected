@@ -1,6 +1,7 @@
 {
   "domain": "wisniowski_connected",
   "name": "Wisniowski Connected",
+  "categories": ["blinds_curtains"],
   "codeowners": ["@jestempablo"],
   "config_flow": true,
   "documentation": "https://github.com/jestempablo/home-assistant-wisniowski-connected",
