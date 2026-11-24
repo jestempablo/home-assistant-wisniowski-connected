@@ -8,7 +8,7 @@ from types import ModuleType
 import unittest
 from unittest.mock import patch
 
-from aiohttp import ClientSession, web
+from aiohttp import ClientConnectionError, ClientSession, web
 from aiohttp.test_utils import TestServer
 
 # Load the standalone client without running the Home Assistant entry point.
@@ -21,7 +21,7 @@ sys.modules[PACKAGE] = package
 api = importlib.import_module(f"{PACKAGE}.api")
 
 
-class GraphqlTests(unittest.IsolatedAsyncioTestCase):
+class CloudClientTests(unittest.IsolatedAsyncioTestCase):
     """Cover broker failures, token refresh, and recovery on the next poll."""
 
     async def asyncSetUp(self):
@@ -29,9 +29,13 @@ class GraphqlTests(unittest.IsolatedAsyncioTestCase):
         self.requests = []
         self.token_requests = []
         self.token_updates = []
+        self.token_error = None
+        self.token_lifetime = 3600
         app = web.Application()
         app.router.add_post("/graphql/", self.handle_graphql)
         app.router.add_post("/token", self.handle_token)
+        app.router.add_post("/gate/setDirection", self.handle_gate_command)
+        app.router.add_get("/userinfo", self.handle_userinfo)
         self.server = TestServer(app)
         await self.server.start_server()
         self.addAsyncCleanup(self.server.close)
@@ -64,13 +68,29 @@ class GraphqlTests(unittest.IsolatedAsyncioTestCase):
 
     async def handle_token(self, request):
         self.token_requests.append(dict(await request.post()))
+        if self.token_error is not None:
+            status, body = self.token_error
+            return web.Response(status=status, text=body)
         return web.json_response(
             {
                 "access_token": "refreshed-access-token",
                 "refresh_token": "rotated-refresh-token",
-                "expires_in": 3600,
+                "expires_in": self.token_lifetime,
             }
         )
+
+    async def handle_gate_command(self, request):
+        self.requests.append(
+            (request.headers["Authorization"], request.headers["installationId"], await request.json())
+        )
+        if not self.responses:
+            return web.json_response({"error": "Unexpected extra command"}, status=500)
+        status, body = self.responses.pop(0)
+        return web.Response(status=status, text=body)
+
+    async def handle_userinfo(self, request):
+        status, body = self.responses.pop(0)
+        return web.Response(status=status, text=body)
 
     async def graphql(self):
         return await self.client.async_graphql(
@@ -151,6 +171,109 @@ class GraphqlTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaisesRegex(api.WisniowskiApiError, "Invalid GraphQL response"):
                     await self.graphql()
         self.assertEqual(self.token_requests, [])
+
+    async def test_token_transport_errors_preserve_refresh_token_and_can_retry(self):
+        client = api.WisniowskiClient(
+            self.session, {**self.client.data, "expires_at": 0}, self.token_updates.append
+        )
+        for error in (ClientConnectionError("disconnected"), TimeoutError()):
+            with self.subTest(error=type(error).__name__):
+                with patch.object(self.session, "post", side_effect=error):
+                    with self.assertRaises(api.WisniowskiApiError) as raised:
+                        await client.async_access_token()
+                self.assertIs(raised.exception.__cause__, error)
+                self.assertEqual(client.data["refresh_token"], "original-refresh-token")
+                self.assertEqual(self.token_updates, [])
+        self.assertEqual(await client.async_access_token(), "refreshed-access-token")
+        self.assertEqual(len(self.token_requests), 1)
+        self.assertEqual(self.token_updates[0]["refresh_token"], "rotated-refresh-token")
+
+    async def test_token_endpoint_errors_distinguish_rejection_from_outage(self):
+        for status, body, expected, message in (
+            (400, '{"error_description": "Token has expired"}', api.WisniowskiAuthError, "Token has expired"),
+            (400, '{"error": "temporarily_unavailable"}', api.WisniowskiApiError, "temporarily_unavailable"),
+            (400, '{"error": "server_error", "error_description": "Try later"}', api.WisniowskiApiError, "Try later"),
+            (401, '{"error": "invalid_client"}', api.WisniowskiAuthError, "invalid_client"),
+            (401, "<html>Unauthorized</html>", api.WisniowskiAuthError, "401"),
+            (429, '{"error": "Too many requests"}', api.WisniowskiApiError, "429"),
+            (503, "<html>Unavailable</html>", api.WisniowskiApiError, "503"),
+            (200, "{}", api.WisniowskiApiError, "access token"),
+        ):
+            with self.subTest(status=status, body=body):
+                self.token_error = status, body
+                with self.assertRaisesRegex(expected, message):
+                    await api.WisniowskiClient.async_from_code(self.session, "code", "verifier")
+
+    async def test_userinfo_distinguishes_denied_access_from_service_failure(self):
+        with patch.object(api, "KEYCLOAK_USERINFO_URL", str(self.server.make_url("/userinfo"))):
+            for status, body, expected in (
+                (401, "<html>Unauthorized</html>", api.WisniowskiAuthError),
+                (403, '{"error": "insufficient_scope"}', api.WisniowskiAuthError),
+                (429, '{"error": "Too many requests"}', api.WisniowskiApiError),
+                (503, "<html>Unavailable</html>", api.WisniowskiApiError),
+            ):
+                with self.subTest(status=status):
+                    self.responses = [(status, body)]
+                    with self.assertRaisesRegex(expected, f"HTTP {status}"):
+                        await self.client.async_userinfo()
+            self.responses = [(200, '{"sub": "test-user"}')]
+            self.assertEqual(await self.client.async_userinfo(), {"sub": "test-user"})
+        self.assertEqual(self.token_requests, [])
+
+    async def test_userinfo_transport_failure_is_retryable(self):
+        for error in (ClientConnectionError("disconnected"), TimeoutError()):
+            with self.subTest(error=type(error).__name__):
+                with patch.object(self.session, "get", side_effect=error):
+                    with self.assertRaises(api.WisniowskiApiError) as raised:
+                        await self.client.async_userinfo()
+                self.assertIs(raised.exception.__cause__, error)
+
+    def rest_client(self):
+        return api.WisniowskiClient(
+            self.session,
+            {
+                **self.client.data,
+                "installation_id": "test-installation",
+                "broker_url": str(self.server.make_url("/")),
+            },
+            self.token_updates.append,
+        )
+
+    async def test_rest_401_retries_same_command_once_with_refreshed_token(self):
+        self.responses = [(401, "<html>Unauthorized</html>"), (200, '{"ok": true}')]
+        self.token_lifetime = 60
+        command = {"channelId": "test-gate", "direction": 2}
+        result = await self.rest_client()._async_rest_post("/gate/setDirection", command)
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(
+            self.requests,
+            [
+                ("Bearer original-access-token", "test-installation", command),
+                ("Bearer refreshed-access-token", "test-installation", command),
+            ],
+        )
+        self.assertEqual(len(self.token_requests), 1)
+
+    async def test_rest_503_does_not_replay_command(self):
+        self.responses = [(503, '{"error": "Unavailable"}')]
+        with self.assertRaisesRegex(api.WisniowskiApiError, "Unavailable"):
+            await self.rest_client()._async_rest_post("/gate/setDirection", {"direction": 3})
+        self.assertEqual(len(self.requests), 1)
+        self.assertEqual(self.token_requests, [])
+
+    async def test_rest_repeated_401_stops_after_one_refresh(self):
+        self.responses = [(401, "{}"), (401, "{}")]
+        with self.assertRaisesRegex(api.WisniowskiAuthError, "401"):
+            await self.rest_client()._async_rest_post("/gate/setDirection", {"direction": 3})
+        self.assertEqual(len(self.requests), 2)
+        self.assertEqual(len(self.token_requests), 1)
+
+    async def test_rest_does_not_replay_command_on_timeout(self):
+        with patch.object(self.session, "post", side_effect=TimeoutError()) as post:
+            with self.assertRaises(api.WisniowskiApiError):
+                await self.rest_client()._async_rest_post("/gate/setDirection", {"direction": 3})
+        post.assert_called_once()
+        self.assertEqual(self.token_updates, [])
 
 
 if __name__ == "__main__":

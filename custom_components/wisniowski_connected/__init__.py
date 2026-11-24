@@ -29,7 +29,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     try:
         await client.async_initialize()
-        coordinator = WisniowskiCoordinator(hass, client)
+        coordinator = WisniowskiCoordinator(hass, entry, client)
         await coordinator.async_start()
     except WisniowskiAuthError as exc:
         raise ConfigEntryAuthFailed(str(exc)) from exc

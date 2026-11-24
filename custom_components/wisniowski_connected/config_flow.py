@@ -82,8 +82,9 @@ class WisniowskiConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                         errors["base"] = "wrong_account"
                         self._prepare_authorization()
                     else:
-                        self.hass.config_entries.async_update_entry(self._reauth_entry, data=data, title=title)
-                        return self.async_abort(reason="reauth_success")
+                        return self.async_update_reload_and_abort(
+                            self._reauth_entry, data=data, title=title, reason="reauth_success"
+                        )
                 else:
                     await self.async_set_unique_id(user_id)
                     self._abort_if_unique_id_configured()

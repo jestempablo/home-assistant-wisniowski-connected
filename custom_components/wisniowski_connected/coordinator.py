@@ -8,10 +8,12 @@ from datetime import timedelta
 import logging
 from typing import Any
 
+from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
-from .api import WisniowskiClient, WisniowskiError, WisniowskiGate
+from .api import WisniowskiAuthError, WisniowskiClient, WisniowskiError, WisniowskiGate
 from .const import DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
@@ -30,10 +32,15 @@ class WisniowskiRuntime:
 class WisniowskiCoordinator(DataUpdateCoordinator[dict[str, WisniowskiGate]]):
     """Coordinator backed by GraphQL subscriptions with slow polling fallback."""
 
-    def __init__(self, hass: HomeAssistant, client: WisniowskiClient) -> None:
+    config_entry: ConfigEntry
+
+    def __init__(
+        self, hass: HomeAssistant, entry: ConfigEntry, client: WisniowskiClient
+    ) -> None:
         super().__init__(
             hass,
             _LOGGER,
+            config_entry=entry,
             name=DOMAIN,
             update_interval=SCAN_INTERVAL,
         )
@@ -45,6 +52,10 @@ class WisniowskiCoordinator(DataUpdateCoordinator[dict[str, WisniowskiGate]]):
     async def _async_update_data(self) -> dict[str, WisniowskiGate]:
         try:
             return await self.client.async_get_gates()
+        except WisniowskiAuthError as exc:
+            if self._subscription_task:
+                self._subscription_task.cancel()
+            raise ConfigEntryAuthFailed(str(exc)) from exc
         except WisniowskiError as exc:
             raise UpdateFailed(str(exc)) from exc
 
@@ -84,6 +95,10 @@ class WisniowskiCoordinator(DataUpdateCoordinator[dict[str, WisniowskiGate]]):
                     backoff = 2
             except asyncio.CancelledError:
                 raise
+            except WisniowskiAuthError as exc:
+                self.async_set_update_error(ConfigEntryAuthFailed(str(exc)))
+                self.config_entry.async_start_reauth(self.hass)
+                return
             except Exception as exc:  # noqa: BLE001
                 _LOGGER.debug("Wisniowski subscription disconnected: %s", exc)
                 await asyncio.sleep(backoff)

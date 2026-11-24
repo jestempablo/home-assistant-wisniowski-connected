@@ -35,7 +35,10 @@ def subscription(enable_custom_integrations, monkeypatch):
     async def subscribe(client, gate_ids):
         try:
             while True:
-                yield await events.get()
+                event = await events.get()
+                if isinstance(event, Exception):
+                    raise event
+                yield event
         finally:
             disconnected.set()
 

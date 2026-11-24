@@ -214,13 +214,26 @@ class WisniowskiClient:
     async def _async_token_request(session: ClientSession, data: dict[str, Any]) -> dict[str, Any]:
         try:
             async with session.post(KEYCLOAK_TOKEN_URL, data=data, timeout=REQUEST_TIMEOUT) as response:
-                payload = await response.json(content_type=None)
                 if response.status >= 400:
-                    description = payload.get("error_description") or payload.get("error") or response.reason
+                    description = f"Token request returned HTTP {response.status}"
+                    if response.status not in (400, 401):
+                        raise WisniowskiApiError(description)
+                    try:
+                        payload = await response.json(content_type=None)
+                    except ValueError:
+                        raise WisniowskiAuthError(description) from None
+                    if isinstance(payload, dict):
+                        error = payload.get("error")
+                        description = payload.get("error_description") or error or description
+                        if error in ("temporarily_unavailable", "server_error"):
+                            raise WisniowskiApiError(str(description))
                     raise WisniowskiAuthError(str(description))
+                payload = await response.json(content_type=None)
+                if not isinstance(payload, dict) or not payload.get("access_token"):
+                    raise WisniowskiApiError("Token endpoint did not return an access token")
                 return payload
-        except (ClientError, asyncio.TimeoutError) as exc:
-            raise WisniowskiAuthError(str(exc)) from exc
+        except (ClientError, asyncio.TimeoutError, ValueError) as exc:
+            raise WisniowskiApiError(str(exc) or "Token request failed") from exc
 
     @property
     def data(self) -> dict[str, Any]:
@@ -246,12 +259,17 @@ class WisniowskiClient:
         headers = {"Authorization": f"Bearer {await self.async_access_token()}"}
         try:
             async with self._session.get(KEYCLOAK_USERINFO_URL, headers=headers, timeout=REQUEST_TIMEOUT) as response:
-                payload = await response.json(content_type=None)
                 if response.status >= 400:
-                    raise WisniowskiAuthError(str(payload))
+                    description = f"Userinfo request returned HTTP {response.status}"
+                    if response.status in (401, 403):
+                        raise WisniowskiAuthError(description)
+                    raise WisniowskiApiError(description)
+                payload = await response.json(content_type=None)
+                if not isinstance(payload, dict):
+                    raise WisniowskiApiError("Userinfo endpoint did not return an object")
                 return payload
-        except (ClientError, asyncio.TimeoutError) as exc:
-            raise WisniowskiAuthError(str(exc)) from exc
+        except (ClientError, asyncio.TimeoutError, ValueError) as exc:
+            raise WisniowskiApiError(str(exc) or "Userinfo request failed") from exc
 
     async def async_access_token(self) -> str:
         """Return a valid access token, refreshing and storing rotated tokens."""
@@ -371,9 +389,9 @@ class WisniowskiClient:
 
         raise WisniowskiAuthError("GraphQL request returned HTTP 401 after token refresh")
 
-    async def _force_refresh(self) -> None:
+    async def _force_refresh(self) -> str:
         self._data[CONF_EXPIRES_AT] = 0
-        await self.async_access_token()
+        return await self.async_access_token()
 
     async def async_get_gates(self) -> dict[str, WisniowskiGate]:
         """Fetch all configured gate channels."""
@@ -451,27 +469,32 @@ class WisniowskiClient:
         )
 
     async def _async_rest_post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
-        headers = {
-            "Authorization": f"Bearer {await self.async_access_token()}",
-            "Content-Type": "application/json",
-            "installationId": str(self.installation_id or ""),
-        }
-        try:
-            async with self._session.post(
-                f"{self.broker_url}{path}",
-                headers=headers,
-                json=payload,
-                timeout=REQUEST_TIMEOUT,
-            ) as response:
-                data = await response.json(content_type=None)
-                if response.status == 401:
-                    await self._force_refresh()
-                    return await self._async_rest_post(path, payload)
-                if response.status >= 400:
-                    raise WisniowskiApiError(str(data))
-                return data
-        except (ClientError, asyncio.TimeoutError) as exc:
-            raise WisniowskiApiError(str(exc)) from exc
+        token = await self.async_access_token()
+        for attempt in range(2):
+            if attempt:
+                token = await self._force_refresh()
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+                "installationId": str(self.installation_id or ""),
+            }
+            try:
+                async with self._session.post(
+                    f"{self.broker_url}{path}",
+                    headers=headers,
+                    json=payload,
+                    timeout=REQUEST_TIMEOUT,
+                ) as response:
+                    if response.status == 401:
+                        continue
+                    data = await response.json(content_type=None)
+                    if response.status >= 400:
+                        raise WisniowskiApiError(str(data))
+                    return data
+            except (ClientError, asyncio.TimeoutError, ValueError) as exc:
+                raise WisniowskiApiError(str(exc)) from exc
+
+        raise WisniowskiAuthError("REST request returned HTTP 401 after token refresh")
 
     async def async_subscribe(self, gate_ids: list[str]) -> AsyncIterator[dict[str, Any]]:
         """Yield GraphQL subscription updates."""

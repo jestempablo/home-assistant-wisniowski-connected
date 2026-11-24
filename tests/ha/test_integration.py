@@ -1,12 +1,15 @@
 """Exercise flows and config entries through Home Assistant."""
 
+import asyncio
 import base64
 import hashlib
 import time
 from unittest.mock import patch
 
+import pytest
 from homeassistant.config_entries import SOURCE_USER, ConfigEntryState
 from homeassistant.data_entry_flow import FlowResultType
+from homeassistant.exceptions import ConfigEntryAuthFailed
 from yarl import URL
 
 from custom_components.wisniowski_connected import api
@@ -49,6 +52,19 @@ async def test_config_flow_rejects_wrong_state(hass, cloud):
     assert result["type"] is FlowResultType.FORM
     assert result["errors"] == {"base": "invalid_auth"}
     assert cloud.call_count == 0
+    assert not hass.config_entries.async_entries(DOMAIN)
+
+
+async def test_config_flow_token_outage_shows_cannot_connect(hass, aioclient_mock):
+    aioclient_mock.post(api.KEYCLOAK_TOKEN_URL, status=503, text="Service unavailable")
+    flow = await hass.config_entries.flow.async_init(DOMAIN, context={"source": SOURCE_USER})
+    auth = URL(flow["description_placeholders"]["authorization_url"]).query
+    callback = URL("https://callback.example.invalid").with_query(code="test", state=auth["state"])
+    result = await hass.config_entries.flow.async_configure(
+        flow["flow_id"], {"auth_response_url": str(callback)}
+    )
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {"base": "cannot_connect"}
     assert not hass.config_entries.async_entries(DOMAIN)
 
 
@@ -104,11 +120,15 @@ async def test_rejected_refresh_starts_reauth(hass, entry, aioclient_mock):
     assert flow["context"]["entry_id"] == entry.entry_id
 
 
-async def test_broker_unavailable_during_setup(hass, entry, aioclient_mock):
-    aioclient_mock.post(
-        f"{api.INITIAL_BROKER_URL}/graphql/?opname=CurrentInstallation",
-        status=503, text="Service unavailable",
-    )
+@pytest.mark.parametrize(
+    "endpoint",
+    [f"{api.INITIAL_BROKER_URL}/graphql/?opname=CurrentInstallation", api.KEYCLOAK_TOKEN_URL],
+    ids=["broker", "token"],
+)
+async def test_outage_during_setup_retries(hass, entry, aioclient_mock, endpoint):
+    if endpoint == api.KEYCLOAK_TOKEN_URL:
+        hass.config_entries.async_update_entry(entry, data={**entry.data, "expires_at": 0})
+    aioclient_mock.post(endpoint, status=503, text="Service unavailable")
     await hass.config_entries.async_setup(entry.entry_id)
     await hass.async_block_till_done()
     assert entry.state is ConfigEntryState.SETUP_RETRY
@@ -128,6 +148,85 @@ async def test_poll_recovers_after_broker_error(hass, entry, cloud):
         await coordinator.async_refresh()
     assert not coordinator.last_update_success
     assert hass.states.get(entity_id).state == "unavailable"
+    assert not hass.config_entries.flow.async_progress_by_handler(DOMAIN)
     await coordinator.async_refresh()
     assert coordinator.last_update_success
     assert hass.states.get(entity_id).state == "closed"
+
+
+async def test_runtime_poll_auth_failure_starts_reauth(hass, entry, cloud, subscription):
+    _, disconnected = subscription
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    coordinator = hass.data[DOMAIN][entry.entry_id][DATA_COORDINATOR]
+    cloud.clear_requests()
+    cloud.post(f"{coordinator.client.broker_url}/graphql/?opname=DevicesGetAll", status=401)
+    cloud.post(api.KEYCLOAK_TOKEN_URL, status=400, json={"error": "invalid_grant"})
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    assert isinstance(coordinator.last_exception, ConfigEntryAuthFailed)
+    assert not coordinator.last_update_success
+    assert disconnected.is_set()
+    (flow,) = hass.config_entries.flow.async_progress_by_handler(DOMAIN)
+    assert flow["context"]["source"] == "reauth"
+    assert flow["context"]["entry_id"] == entry.entry_id
+
+
+async def test_subscription_recovers_after_transport_failure(hass, entry, cloud, subscription):
+    events, _ = subscription
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    coordinator = hass.data[DOMAIN][entry.entry_id][DATA_COORDINATOR]
+    updated = asyncio.Event()
+    remove_listener = coordinator.async_add_listener(updated.set)
+    try:
+        events.put_nowait(ConnectionResetError("connection reset"))
+        events.put_nowait({"onGateStatusChanged": {"channelId": "test-channel-id", "position": 35}})
+        async with asyncio.timeout(10):
+            await updated.wait()
+        assert coordinator.data["test-channel-id"].position == 35
+        assert not hass.config_entries.flow.async_progress_by_handler(DOMAIN)
+    finally:
+        remove_listener()
+
+
+async def test_subscription_auth_failure_stops_listener_and_starts_reauth(hass, entry, cloud, subscription):
+    events, _ = subscription
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    coordinator = hass.data[DOMAIN][entry.entry_id][DATA_COORDINATOR]
+    events.put_nowait(api.WisniowskiAuthError("invalid_grant"))
+    await hass.async_block_till_done()
+    listener = coordinator._subscription_task
+    assert listener.done()
+    assert listener.exception() is None
+    assert not coordinator.last_update_success
+    (flow,) = hass.config_entries.flow.async_progress_by_handler(DOMAIN)
+    assert flow["context"]["source"] == "reauth"
+    assert flow["context"]["entry_id"] == entry.entry_id
+
+
+async def test_reauth_reloads_entry_with_new_credentials(hass, entry, cloud, subscription):
+    _, disconnected = subscription
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    old_coordinator = hass.data[DOMAIN][entry.entry_id][DATA_COORDINATOR]
+    entry.async_start_reauth(hass)
+    await hass.async_block_till_done()
+    (flow,) = hass.config_entries.flow.async_progress_by_handler(DOMAIN)
+    form = await hass.config_entries.flow.async_configure(flow["flow_id"])
+    state = URL(form["description_placeholders"]["authorization_url"]).query["state"]
+    callback = URL("https://callback.example.invalid").with_query(code="new-code", state=state)
+    result = await hass.config_entries.flow.async_configure(
+        flow["flow_id"], {"auth_response_url": str(callback)}
+    )
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reauth_success"
+    await hass.async_block_till_done()
+    assert hass.config_entries.async_entries(DOMAIN) == [entry]
+    assert entry.state is ConfigEntryState.LOADED
+    coordinator = hass.data[DOMAIN][entry.entry_id][DATA_COORDINATOR]
+    assert coordinator is not old_coordinator
+    assert disconnected.is_set()
+    assert entry.data["refresh_token"] == "test-renewed-refresh"
+    assert coordinator.client.data["refresh_token"] == entry.data["refresh_token"]
